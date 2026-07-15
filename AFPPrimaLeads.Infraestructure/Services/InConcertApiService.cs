@@ -94,12 +94,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
             || r.StatusCode == System.Net.HttpStatusCode.RequestTimeout
             || r.StatusCode == System.Net.HttpStatusCode.TooManyRequests;
 
-        public async Task<string> LoginAsync()
+        public async Task<string> LoginAsync(CancellationToken ct = default)
         {
             if (_cachedToken is not null && DateTime.UtcNow < _tokenExpiresAtUtc)
                 return _cachedToken;
 
-            if (!await _tokenLock.WaitAsync(TokenLockTimeout))
+            if (!await _tokenLock.WaitAsync(TokenLockTimeout, ct))
                 throw new TimeoutException("No se pudo obtener el lock del token de InConcert a tiempo.");
 
             try
@@ -115,15 +115,15 @@ namespace AFPPrimaLeads.Infraestructure.Services
                 var context = new Context();
                 try
                 {
-                    var response = await _criticalPolicy.ExecuteAsync(async _ =>
+                    var response = await _criticalPolicy.ExecuteAsync(async (_, innerCt) =>
                     {
                         var payload = JsonConvert.SerializeObject(new { user = _user, password = _password });
                         var content = new StringContent(payload, Encoding.UTF8, "application/json");
-                        return await _httpClient.PostAsync($"{_baseUrl}/login/", content);
-                    }, context);
+                        return await _httpClient.PostAsync($"{_baseUrl}/login/", content, innerCt);
+                    }, context, ct);
 
                     response.EnsureSuccessStatusCode();
-                    var body = await response.Content.ReadAsStringAsync();
+                    var body = await response.Content.ReadAsStringAsync(ct);
                     var obj  = JObject.Parse(body);
                     var token = obj["token"]?.Value<string>()
                         ?? throw new InvalidOperationException($"La respuesta de login no contiene 'token'. Respuesta: {body}");
@@ -131,6 +131,13 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     _cachedToken = token;
                     _tokenExpiresAtUtc = DateTime.UtcNow + _tokenLifetime;
                     return token;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // Shutdown en curso — se propaga tal cual (sin envolver en
+                    // InvalidOperationException) para que quien llama pueda distinguirlo
+                    // de una falla real de login y no lo trate ni loguee como error.
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -173,25 +180,25 @@ namespace AFPPrimaLeads.Infraestructure.Services
         /// Worker ni depender de que otro worker lo haga.
         /// </summary>
         private async Task<HttpResponseMessage> SendAuthenticatedAsync(
-            Func<string, HttpRequestMessage> buildRequest, Context context, IAsyncPolicy<HttpResponseMessage> policy)
+            Func<string, HttpRequestMessage> buildRequest, Context context, IAsyncPolicy<HttpResponseMessage> policy, CancellationToken ct)
         {
-            var token = await LoginAsync();
+            var token = await LoginAsync(ct);
             var response = await policy.ExecuteAsync(
-                _ => _httpClient.SendAsync(buildRequest(token)), context);
+                (_, innerCt) => _httpClient.SendAsync(buildRequest(token), innerCt), context, ct);
 
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
                 _logger.LogWarning("InConcert devolvió 401 — generando token nuevo y reintentando una vez.");
                 await InvalidateTokenAsync();
-                token = await LoginAsync();
+                token = await LoginAsync(ct);
                 response = await policy.ExecuteAsync(
-                    _ => _httpClient.SendAsync(buildRequest(token)), context);
+                    (_, innerCt) => _httpClient.SendAsync(buildRequest(token), innerCt), context, ct);
             }
 
             return response;
         }
 
-        public async Task<bool> SetSkillsAsync(SetSkillsRequest request)
+        public async Task<bool> SetSkillsAsync(SetSkillsRequest request, CancellationToken ct = default)
         {
             var settings = new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore };
             var json     = JsonConvert.SerializeObject(request, settings);
@@ -208,10 +215,16 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     };
                     msg.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
                     return msg;
-                }, context, _skillsPolicy);
+                }, context, _skillsPolicy, ct);
 
                 response.EnsureSuccessStatusCode();
                 return true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso — no es una falla de skills, se propaga para que el
+                // caller lo distinga de un fallo real (no debe loguearse como error).
+                throw;
             }
             catch (Exception ex)
             {
@@ -224,7 +237,7 @@ namespace AFPPrimaLeads.Infraestructure.Services
         }
 
         /// <returns>actionId devuelto por IC, o null si falló tras los reintentos.</returns>
-        public async Task<string?> AddContactAsync(OutboundRequest request)
+        public async Task<string?> AddContactAsync(OutboundRequest request, CancellationToken ct = default)
         {
             var json    = JsonConvert.SerializeObject(request);
             var context = new Context();
@@ -240,15 +253,24 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     };
                     msg.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
                     return msg;
-                }, context, _criticalPolicy);
+                }, context, _criticalPolicy, ct);
 
                 response.EnsureSuccessStatusCode();
 
-                var body = await response.Content.ReadAsStringAsync();
+                var body = await response.Content.ReadAsStringAsync(ct);
                 var obj  = JObject.Parse(body);
 
                 return obj["actionId"]?.Value<string>()
                     ?? throw new InvalidOperationException($"La respuesta de IC no contiene 'actionId'. Respuesta: {body}");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso — se propaga tal cual. Si esto pasó mientras se
+                // esperaba la respuesta de IC, existe la posibilidad de que el contacto
+                // ya se haya creado del lado de IC sin que lleguemos a leer el actionId;
+                // el reintento en el próximo arranque puede duplicar en ese caso puntual
+                // (riesgo preexistente a un kill duro del proceso, no nuevo).
+                throw;
             }
             catch (Exception ex)
             {

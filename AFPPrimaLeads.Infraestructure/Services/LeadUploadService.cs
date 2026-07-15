@@ -83,19 +83,19 @@ namespace AFPPrimaLeads.Infraestructure.Services
 
                 // Reintentos pendientes de corridas anteriores primero — los consumers ya
                 // arrancan a subirlos mientras todavía esperamos la respuesta de Prima.
-                var pendientes = await _gssRepo.GetPendingRetryAsync(_maxRetryBatchSize);
+                var pendientes = await _gssRepo.GetPendingRetryAsync(_maxRetryBatchSize, ct);
                 _producerHeartbeat.ReportAlive();
                 foreach (var p in pendientes)
                     await channel.Writer.WriteAsync(new UploadItem(p.Id, p.ContactId, p.BatchId, p.Prospecto), ct);
 
-                var prospectosNuevos = await _primaApiService.GetProspectosAsync();
+                var prospectosNuevos = await _primaApiService.GetProspectosAsync(ct);
                 _logger.LogInformation("Se descargaron {Count} prospectos nuevos de Prima.", prospectosNuevos.Count);
                 _producerHeartbeat.ReportAlive();
 
                 foreach (var prospecto in prospectosNuevos)
                 {
                     var contactId = Guid.NewGuid().ToString("N");
-                    var gssId = await _gssRepo.InsertAsync(prospecto, batchId, outboundProcessId, contactId);
+                    var gssId = await _gssRepo.InsertAsync(prospecto, batchId, outboundProcessId, contactId, ct);
                     await channel.Writer.WriteAsync(new UploadItem(gssId, contactId, batchId, prospecto), ct);
                     _producerHeartbeat.ReportAlive();
                 }
@@ -150,14 +150,14 @@ namespace AFPPrimaLeads.Infraestructure.Services
 
                 while (reader.TryRead(out var item))
                 {
-                    await ProcessItemAsync(item);
+                    await ProcessItemAsync(item, ct);
                     _consumersHeartbeat.ReportAlive();
                     _consumersHeartbeat.ReportProgress();
                 }
             }
         }
 
-        private async Task ProcessItemAsync(UploadItem item)
+        private async Task ProcessItemAsync(UploadItem item, CancellationToken ct)
         {
             using (LogContext.PushProperty("ContactId", item.ContactId))
             {
@@ -168,12 +168,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     var request = BuildRequest(lead, item.Prospecto);
 
                     var sw = Stopwatch.StartNew();
-                    var actionId = await _inConcertApiService.AddContactAsync(request);
+                    var actionId = await _inConcertApiService.AddContactAsync(request, ct);
                     sw.Stop();
 
                     if (actionId is not null)
                     {
-                        await _gssRepo.MarkUploadedAsync(item.GssId, (int)sw.Elapsed.TotalSeconds, item.ContactId);
+                        await _gssRepo.MarkUploadedAsync(item.GssId, (int)sw.Elapsed.TotalSeconds, item.ContactId, ct);
 
                         if (_skillsEnabled && _skillItems.Count > 0)
                         {
@@ -183,7 +183,7 @@ namespace AFPPrimaLeads.Infraestructure.Services
                                 contactId = item.ContactId,
                                 skills = _skillItems
                             };
-                            var skillsOk = await _inConcertApiService.SetSkillsAsync(skillsRequest);
+                            var skillsOk = await _inConcertApiService.SetSkillsAsync(skillsRequest, ct);
                             if (!skillsOk)
                                 _logger.LogWarning(
                                     "El contacto se subió pero falló la asignación de skills. ContactId: {ContactId}.",
@@ -192,13 +192,22 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     }
                     else
                     {
-                        await _gssRepo.RegisterFailedAttemptAsync(item.GssId);
+                        await _gssRepo.RegisterFailedAttemptAsync(item.GssId, ct);
                         _logger.LogWarning("Fallo al enviar prospecto {Dni}. GssId: {GssId}.", item.Prospecto.dni, item.GssId);
                     }
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // Shutdown en curso — el item no se marcó ni sumó intento fallido,
+                    // así que GetPendingRetryAsync lo va a recoger solo en el próximo
+                    // arranque. No es un error real, no se loguea como tal.
+                    _logger.LogInformation(
+                        "Prospecto no se llegó a procesar antes del shutdown — se reintentará al próximo arranque. GssId: {GssId}.",
+                        item.GssId);
+                }
                 catch (Exception ex)
                 {
-                    await _gssRepo.RegisterFailedAttemptAsync(item.GssId);
+                    await _gssRepo.RegisterFailedAttemptAsync(item.GssId, ct);
                     _logger.LogError(ex, "Error procesando prospecto {Dni}. GssId: {GssId}.", item.Prospecto.dni, item.GssId);
                 }
             }

@@ -45,7 +45,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                 .Handle<SqlException>(ex => TransientSqlErrorNumbers.Contains(ex.Number))
                 .WaitAndRetryAsync(retryCount, _ => TimeSpan.FromSeconds(2));
         }
-        public async Task<int> InsertAsync(Prospecto prospecto, string batchId, string outboundProcessId, string contactId)
+        public async Task<int> InsertAsync(Prospecto prospecto, string batchId, string outboundProcessId, string contactId, CancellationToken ct = default)
         {
             const string sql = """
                 INSERT INTO dbo.GSS_Prospectos (
@@ -69,10 +69,10 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
 
             try
             {
-                return await _dbRetryPolicy.ExecuteAsync(async () =>
+                return await _dbRetryPolicy.ExecuteAsync(async innerCt =>
                 {
                     using var conn = _db.CreateConnection();
-                    return await conn.ExecuteScalarAsync<int>(sql, new
+                    var command = new CommandDefinition(sql, new
                     {
                         Dni                   = prospecto.dni,
                         PrimerNombre          = prospecto.primerNombre,
@@ -105,8 +105,14 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                         UtmCampaign           = prospecto.utmCampaign,
                         UtmContent            = prospecto.utmContent,
                         ContactId             = contactId
-                    });
-                });
+                    }, cancellationToken: innerCt);
+                    return await conn.ExecuteScalarAsync<int>(command);
+                }, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso — no es una falla de inserción real.
+                throw;
             }
             catch (Exception ex)
             {
@@ -117,7 +123,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
             }
         }
 
-        public async Task<IReadOnlyList<ProspectoPendiente>> GetPendingRetryAsync(int maxBatchSize)
+        public async Task<IReadOnlyList<ProspectoPendiente>> GetPendingRetryAsync(int maxBatchSize, CancellationToken ct = default)
         {
             // TOP (@MaxBatchSize) es a propósito: sin tope, un backlog acumulado por una
             // caída larga de InConcert (30+ min) podría devolver miles de filas en una
@@ -137,11 +143,14 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
 
             try
             {
-                var rows = await _dbRetryPolicy.ExecuteAsync(async () =>
+                var rows = await _dbRetryPolicy.ExecuteAsync(async innerCt =>
                 {
                     using var conn = _db.CreateConnection();
-                    return await conn.QueryAsync<RetryRow>(sql, new { MaxBatchSize = maxBatchSize, MaxIntentos = _maxIntentos });
-                });
+                    var command = new CommandDefinition(sql,
+                        new { MaxBatchSize = maxBatchSize, MaxIntentos = _maxIntentos },
+                        cancellationToken: innerCt);
+                    return await conn.QueryAsync<RetryRow>(command);
+                }, ct);
 
                 return rows.Select(r => new ProspectoPendiente
                 {
@@ -180,6 +189,11 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                     }
                 }).ToList();
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso — no es una falla real de lectura.
+                throw;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error al obtener prospectos pendientes de reintento.");
@@ -187,7 +201,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
             }
         }
 
-        public async Task MarkUploadedAsync(int id, int elapsedSeconds, string contactId)
+        public async Task MarkUploadedAsync(int id, int elapsedSeconds, string contactId, CancellationToken ct = default)
         {
             const string sql = """
                 UPDATE dbo.GSS_Prospectos
@@ -197,11 +211,23 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
 
             try
             {
-                await _dbRetryPolicy.ExecuteAsync(async () =>
+                await _dbRetryPolicy.ExecuteAsync(async innerCt =>
                 {
                     using var conn = _db.CreateConnection();
-                    await conn.ExecuteAsync(sql, new { Id = id, ElapsedSeconds = elapsedSeconds });
-                });
+                    var command = new CommandDefinition(sql,
+                        new { Id = id, ElapsedSeconds = elapsedSeconds },
+                        cancellationToken: innerCt);
+                    return await conn.ExecuteAsync(command);
+                }, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso justo después de subir el contacto — se propaga tal
+                // cual; el contacto ya se subió a IC, pero acá se pierde el marcado.
+                // Riesgo aceptado por ahora: el próximo GetPendingRetryAsync lo va a
+                // reintentar y volverá a subirlo (mismo riesgo de duplicado que ya existe
+                // en AddContactAsync ante un cancel a mitad de respuesta).
+                throw;
             }
             catch (Exception ex)
             {
@@ -212,7 +238,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
             }
         }
 
-        public async Task RegisterFailedAttemptAsync(int id)
+        public async Task RegisterFailedAttemptAsync(int id, CancellationToken ct = default)
         {
             const string sql = """
                 UPDATE dbo.GSS_Prospectos
@@ -223,11 +249,18 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
 
             try
             {
-                await _dbRetryPolicy.ExecuteAsync(async () =>
+                await _dbRetryPolicy.ExecuteAsync(async innerCt =>
                 {
                     using var conn = _db.CreateConnection();
-                    await conn.ExecuteAsync(sql, new { Id = id, MaxIntentos = _maxIntentos });
-                });
+                    var command = new CommandDefinition(sql,
+                        new { Id = id, MaxIntentos = _maxIntentos },
+                        cancellationToken: innerCt);
+                    return await conn.ExecuteAsync(command);
+                }, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {

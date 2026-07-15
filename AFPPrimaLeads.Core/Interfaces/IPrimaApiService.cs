@@ -4,8 +4,8 @@ namespace AFPPrimaLeads.Core.Interfaces
 {
     public interface IPrimaApiService
     {
-        Task<string> GetTokenAsync();
+        Task<string> GetTokenAsync(CancellationToken ct = default);
         Task InvalidateTokenAsync();
-        Task<List<Prospecto>> GetProspectosAsync();
+        Task<List<Prospecto>> GetProspectosAsync(CancellationToken ct = default);
     }
 }

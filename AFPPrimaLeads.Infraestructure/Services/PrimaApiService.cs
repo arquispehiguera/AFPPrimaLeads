@@ -67,12 +67,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500)));
         }
 
-        public async Task<string> GetTokenAsync()
+        public async Task<string> GetTokenAsync(CancellationToken ct = default)
         {
             if (_cachedToken is not null && DateTime.UtcNow < _tokenExpiresAtUtc)
                 return _cachedToken;
 
-            if (!await _tokenLock.WaitAsync(TokenLockTimeout))
+            if (!await _tokenLock.WaitAsync(TokenLockTimeout, ct))
                 throw new TimeoutException("No se pudo obtener el lock del token de Prima a tiempo.");
 
             try
@@ -89,7 +89,7 @@ namespace AFPPrimaLeads.Infraestructure.Services
                         new KeyValuePair<string, string>("scope", _scope)
                     });
 
-                    var response = await _requestPolicy.ExecuteAsync(async () =>
+                    var response = await _requestPolicy.ExecuteAsync(async innerCt =>
                     {
                         var request = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}{OAuthPath}")
                         {
@@ -97,11 +97,11 @@ namespace AFPPrimaLeads.Infraestructure.Services
                         };
                         request.Headers.TryAddWithoutValidation("Ocp-Apim-Subscription-Key", _subscriptionKey);
                         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-                        return await _httpClient.SendAsync(request);
-                    });
+                        return await _httpClient.SendAsync(request, innerCt);
+                    }, ct);
                     response.EnsureSuccessStatusCode();
 
-                    var json = await response.Content.ReadAsStringAsync();
+                    var json = await response.Content.ReadAsStringAsync(ct);
                     var result = JsonConvert.DeserializeObject<PrimaTokenResponse>(json)
                         ?? throw new InvalidOperationException("Respuesta vacía al obtener token Prima.");
 
@@ -117,6 +117,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     _cachedToken = token;
                     _tokenExpiresAtUtc = DateTime.UtcNow + lifetime;
                     return token;
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // Shutdown en curso — no es una falla de Prima, no hace falta loguear
+                    // como error ni contaminar el flujo con un log ruidoso por corrida.
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -157,29 +163,29 @@ namespace AFPPrimaLeads.Infraestructure.Services
             return request;
         }
 
-        public async Task<List<Prospecto>> GetProspectosAsync()
+        public async Task<List<Prospecto>> GetProspectosAsync(CancellationToken ct = default)
         {
             try
             {
                 // Igual que InConcert: token vigente por su cuenta, y si el server
                 // responde 401 (venció en medio de la corrida, o el TTL asumido está
                 // mal), se genera uno nuevo YA MISMO y se reintenta una sola vez.
-                var token = await GetTokenAsync();
+                var token = await GetTokenAsync(ct);
                 var response = await _requestPolicy.ExecuteAsync(
-                    () => _httpClient.SendAsync(BuildProspectosRequest(token)));
+                    innerCt => _httpClient.SendAsync(BuildProspectosRequest(token), innerCt), ct);
 
                 if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
                 {
                     _logger.LogWarning("Prima devolvió 401 — generando token nuevo y reintentando una vez.");
                     await InvalidateTokenAsync();
-                    token = await GetTokenAsync();
+                    token = await GetTokenAsync(ct);
                     response = await _requestPolicy.ExecuteAsync(
-                        () => _httpClient.SendAsync(BuildProspectosRequest(token)));
+                        innerCt => _httpClient.SendAsync(BuildProspectosRequest(token), innerCt), ct);
                 }
 
                 response.EnsureSuccessStatusCode();
 
-                var json = await response.Content.ReadAsStringAsync();
+                var json = await response.Content.ReadAsStringAsync(ct);
                 var result = JsonConvert.DeserializeObject<ProspectosResponse>(json)
                     ?? throw new InvalidOperationException("Respuesta vacía al obtener prospectos.");
                 foreach (var p in result.prospectos)
@@ -187,6 +193,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     p.jsonClient = JsonConvert.SerializeObject(p);
                 }
                 return result.prospectos;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Shutdown en curso — se propaga tal cual para que UploadLeadsAsync lo
+                // trate como corte normal, no como falla de Prima.
+                throw;
             }
             catch (Exception ex)
             {
