@@ -1,0 +1,17 @@
+bin/
+obj/
+.vs/
+*.user
+logs/
+.claude/settings.local.json
+.atl/
+
+# Logs y exports sueltos en la raíz — contienen DNI y otra PII de prospectos reales,
+# nunca al repo. El .log se queda en disco, no se borra.
+*.log
+Log.xlsx
+
+# Contiene secretos en texto plano (ClientSecret, Password, SubscriptionKeys) y
+# la connection string real de producción — nunca se sube a git. El archivo se
+# queda en disco tal cual (no se borra), solo se excluye del control de versiones.
+appsettings.json
