@@ -6,7 +6,7 @@ namespace AFPPrimaLeads.Core.Interfaces
     {
         Task<string> LoginAsync(CancellationToken ct = default);
         Task InvalidateTokenAsync();
-        Task<string?> AddContactAsync(OutboundRequest request, CancellationToken ct = default);
+        Task<ContactUploadResult> AddContactAsync(OutboundRequest request, CancellationToken ct = default);
         Task<bool> SetSkillsAsync(SetSkillsRequest request, CancellationToken ct = default);
     }
 }

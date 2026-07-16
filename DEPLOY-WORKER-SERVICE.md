@@ -53,3 +53,6 @@ explícita antes de correrlas.
 - Correr el script `sql/2026-07-14_add-intentos-ic.sql` contra la base ANTES
   de arrancar el servicio — si no, `GetPendingRetryAsync`/`RegisterFailedAttemptAsync`
   fallan por columna inexistente.
+- Correr también `sql/2026-07-16_add-fecha-ultimo-intento-ic.sql` (misma base,
+  mismo motivo) — soporta la reactivación por enfriamiento de prospectos
+  descartados tras una caída larga de InConcert.

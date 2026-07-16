@@ -128,6 +128,7 @@ namespace AFPPrimaLeads.Infraestructure.Services
                         // Sin trabajo pendiente hace un rato — no es un hang, no hay
                         // nada que hacer. El worker sigue vivo y al día.
                         _consumersHeartbeat.ReportAlive();
+                        _consumersHeartbeat.ReportProgress();
                         continue;
                     }
                     hasData = await waitTask;
@@ -141,10 +142,12 @@ namespace AFPPrimaLeads.Infraestructure.Services
                 {
                     // El channel se cerró vacío — no es un hang, es que no había nada
                     // pendiente en este tick (0 reintentos + 0 prospectos nuevos de Prima).
-                    // Sin este ReportAlive, una racha de ticks sin trabajo real (horarios de
-                    // bajo tráfico) deja el heartbeat de Consumers sin tocar por varios
-                    // minutos seguidos, y el Watchdog termina reiniciando un servicio sano.
+                    // Sin este ReportAlive/ReportProgress, una racha de ticks sin trabajo
+                    // real (horarios de bajo tráfico) deja el heartbeat de Consumers sin
+                    // tocar por varios minutos seguidos, y el Watchdog termina reiniciando
+                    // un servicio sano.
                     _consumersHeartbeat.ReportAlive();
+                    _consumersHeartbeat.ReportProgress();
                     break;
                 }
 
@@ -168,10 +171,10 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     var request = BuildRequest(lead, item.Prospecto);
 
                     var sw = Stopwatch.StartNew();
-                    var actionId = await _inConcertApiService.AddContactAsync(request, ct);
+                    var result = await _inConcertApiService.AddContactAsync(request, ct);
                     sw.Stop();
 
-                    if (actionId is not null)
+                    if (result.Success)
                     {
                         await _gssRepo.MarkUploadedAsync(item.GssId, (int)sw.Elapsed.TotalSeconds, item.ContactId, ct);
 
@@ -192,8 +195,10 @@ namespace AFPPrimaLeads.Infraestructure.Services
                     }
                     else
                     {
-                        await _gssRepo.RegisterFailedAttemptAsync(item.GssId, ct);
-                        _logger.LogWarning("Fallo al enviar prospecto {Dni}. GssId: {GssId}.", item.Prospecto.dni, item.GssId);
+                        await _gssRepo.RegisterFailedAttemptAsync(item.GssId, result.FailureKind, ct);
+                        _logger.LogWarning(
+                            "Fallo al enviar prospecto {Dni}. GssId: {GssId}. Motivo: {FailureKind}.",
+                            item.Prospecto.dni, item.GssId, result.FailureKind);
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -207,7 +212,10 @@ namespace AFPPrimaLeads.Infraestructure.Services
                 }
                 catch (Exception ex)
                 {
-                    await _gssRepo.RegisterFailedAttemptAsync(item.GssId, ct);
+                    // Excepción fuera de AddContactAsync (mapeo, prioridad, o el propio
+                    // MarkUploadedAsync/SetSkillsAsync) — no es un problema de infraestructura
+                    // de InConcert, se trata como Permanent (mismo comportamiento que antes).
+                    await _gssRepo.RegisterFailedAttemptAsync(item.GssId, UploadFailureKind.Permanent, ct);
                     _logger.LogError(ex, "Error procesando prospecto {Dni}. GssId: {GssId}.", item.Prospecto.dni, item.GssId);
                 }
             }

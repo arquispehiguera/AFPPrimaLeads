@@ -237,7 +237,7 @@ namespace AFPPrimaLeads.Infraestructure.Services
         }
 
         /// <returns>actionId devuelto por IC, o null si falló tras los reintentos.</returns>
-        public async Task<string?> AddContactAsync(OutboundRequest request, CancellationToken ct = default)
+        public async Task<ContactUploadResult> AddContactAsync(OutboundRequest request, CancellationToken ct = default)
         {
             var json    = JsonConvert.SerializeObject(request);
             var context = new Context();
@@ -260,8 +260,10 @@ namespace AFPPrimaLeads.Infraestructure.Services
                 var body = await response.Content.ReadAsStringAsync(ct);
                 var obj  = JObject.Parse(body);
 
-                return obj["actionId"]?.Value<string>()
+                var actionId = obj["actionId"]?.Value<string>()
                     ?? throw new InvalidOperationException($"La respuesta de IC no contiene 'actionId'. Respuesta: {body}");
+
+                return new ContactUploadResult(actionId);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -278,8 +280,27 @@ namespace AFPPrimaLeads.Infraestructure.Services
                 _logger.LogError(ex,
                     "Error al agregar contacto en InConcert tras {Attempts} reintento(s).",
                     attempts);
-                return null;
+                return new ContactUploadResult(null, ClassifyFailure(ex));
             }
         }
+
+        // Distingue "IC está caído/lento" (no debería quemar un intento del prospecto)
+        // de "IC rechazó este contacto puntual" (sí cuenta como intento real). Un
+        // circuito abierto o un 5xx/408/429 tras agotar los reintentos de Polly es
+        // infraestructura, no un rechazo de dato — mismos criterios que IsTransientFailure.
+        private static UploadFailureKind ClassifyFailure(Exception ex) => ex switch
+        {
+            BrokenCircuitException => UploadFailureKind.Transient,
+            HttpRequestException { StatusCode: null } => UploadFailureKind.Transient,
+            HttpRequestException httpEx when IsTransientStatusCode(httpEx.StatusCode!.Value) => UploadFailureKind.Transient,
+            TaskCanceledException => UploadFailureKind.Transient,
+            TimeoutException => UploadFailureKind.Transient,
+            _ => UploadFailureKind.Permanent
+        };
+
+        private static bool IsTransientStatusCode(System.Net.HttpStatusCode statusCode) =>
+            (int)statusCode >= 500
+            || statusCode == System.Net.HttpStatusCode.RequestTimeout
+            || statusCode == System.Net.HttpStatusCode.TooManyRequests;
     }
 }

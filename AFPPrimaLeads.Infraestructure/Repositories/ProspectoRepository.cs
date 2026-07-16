@@ -15,6 +15,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
         private readonly DbContextApp _db;
         private readonly ILogger<ProspectoRepository> _logger;
         private readonly int _maxIntentos;
+        private readonly int _cooldownHours;
         private readonly IAsyncPolicy _dbRetryPolicy;
 
         // Números de error transitorios de SQL Server (timeout, deadlock, conexión) —
@@ -39,6 +40,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
             _db = db;
             _logger = logger;
             _maxIntentos = configuration.GetValue<int>("ReintentosGss:MaxIntentos", 3);
+            _cooldownHours = configuration.GetValue<int>("ReintentosGss:CooldownHours", 1);
 
             var retryCount = configuration.GetValue<int>("Resiliencia:Db:RetryCount", 3);
             _dbRetryPolicy = Policy
@@ -137,7 +139,9 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                        FechaAfiliacionPrima, ErrorValidacionReniec, ParametrosUtm, UtmSource, UtmMedium,
                        UtmCampaign, UtmContent
                 FROM dbo.GSS_Prospectos
-                WHERE ICUpload = 0 AND IntentosIC < @MaxIntentos
+                WHERE (ICUpload = 0 AND IntentosIC < @MaxIntentos)
+                   OR (ICUpload = 3 AND IntentosIC = @MaxIntentos
+                       AND FechaUltimoIntentoIC < DATEADD(HOUR, -@CooldownHours, GETUTCDATE()))
                 ORDER BY Id;
                 """;
 
@@ -147,7 +151,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                 {
                     using var conn = _db.CreateConnection();
                     var command = new CommandDefinition(sql,
-                        new { MaxBatchSize = maxBatchSize, MaxIntentos = _maxIntentos },
+                        new { MaxBatchSize = maxBatchSize, MaxIntentos = _maxIntentos, CooldownHours = _cooldownHours },
                         cancellationToken: innerCt);
                     return await conn.QueryAsync<RetryRow>(command);
                 }, ct);
@@ -238,12 +242,18 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
             }
         }
 
-        public async Task RegisterFailedAttemptAsync(int id, CancellationToken ct = default)
+        public async Task RegisterFailedAttemptAsync(int id, UploadFailureKind kind, CancellationToken ct = default)
         {
+            // Una falla Transient (InConcert caído, no un rechazo real del dato) no debe
+            // quemar IntentosIC ni tocar ICUpload — si no, un outage de InConcert abandona
+            // prospectos sanos antes de que InConcert siquiera vuelva a responder.
+            // FechaUltimoIntentoIC sí se actualiza siempre: es lo que habilita la
+            // reactivación por enfriamiento en GetPendingRetryAsync.
             const string sql = """
                 UPDATE dbo.GSS_Prospectos
-                SET IntentosIC = IntentosIC + 1,
-                    ICUpload = CASE WHEN IntentosIC + 1 >= @MaxIntentos THEN 3 ELSE 0 END
+                SET IntentosIC = CASE WHEN @Kind = 'Permanent' THEN IntentosIC + 1 ELSE IntentosIC END,
+                    ICUpload = CASE WHEN @Kind = 'Permanent' AND IntentosIC + 1 >= @MaxIntentos THEN 3 ELSE ICUpload END,
+                    FechaUltimoIntentoIC = GETUTCDATE()
                 WHERE Id = @Id;
                 """;
 
@@ -253,7 +263,7 @@ namespace AFPPrimaLeads.Infraestructure.Repositories
                 {
                     using var conn = _db.CreateConnection();
                     var command = new CommandDefinition(sql,
-                        new { Id = id, MaxIntentos = _maxIntentos },
+                        new { Id = id, MaxIntentos = _maxIntentos, Kind = kind.ToString() },
                         cancellationToken: innerCt);
                     return await conn.ExecuteAsync(command);
                 }, ct);
