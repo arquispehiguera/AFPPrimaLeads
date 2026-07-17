@@ -10,6 +10,7 @@ logs/
 # nunca al repo. El .log se queda en disco, no se borra.
 *.log
 Log.xlsx
+Health_*.txt
 
 # Contiene secretos en texto plano (ClientSecret, Password, SubscriptionKeys) y
 # la connection string real de producción — nunca se sube a git. El archivo se
